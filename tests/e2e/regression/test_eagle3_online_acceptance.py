@@ -71,4 +71,9 @@ def test_online_regression(
         acceptance_thresholds=acceptance_thresholds,
         log_freq=50,
         train_timeout=45 * 60,  # 45 mins
+        # Experiment: pin cuBLAS/cuDNN kernels to a deterministic path to see
+        # whether run-to-run acceptance variance collapses. Note the online
+        # pipeline still draws training targets from a live (non-deterministic)
+        # vLLM server, so this only removes torch-side nondeterminism.
+        deterministic=True,
     )

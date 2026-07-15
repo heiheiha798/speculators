@@ -81,6 +81,7 @@ def run_online_e2e(
     acceptance_thresholds: list[float] | None = None,
     log_freq: int = 1,
     train_timeout: int = 30 * 60,  # 30 mins
+    deterministic: bool = False,
 ):
     """
     Run online training e2e testing pipeline.
@@ -113,6 +114,7 @@ def run_online_e2e(
             lr,
             log_freq=log_freq,
             timeout=train_timeout,
+            deterministic=deterministic,
         )
 
     # Step 3: Validate trained checkpoint with vLLM inference

@@ -281,6 +281,7 @@ def run_training(
     target_layer_ids: list[int] | None = None,
     num_layers: int | None = None,
     log_freq: int = 1,
+    deterministic: bool = False,
 ):
     train_cmd = [
         sys.executable,
@@ -324,12 +325,26 @@ def run_training(
         train_cmd += ["--target-layer-ids"] + [str(lid) for lid in target_layer_ids]
     if num_layers is not None:
         train_cmd += ["--num-layers", str(num_layers)]
+    if deterministic:
+        train_cmd += ["--deterministic-cuda"]
     if extra_train_args:
         train_cmd += extra_train_args
 
+    train_env = os.environ.copy()
+    if deterministic:
+        # cuBLAS reproducibility must be configured before the process starts
+        # its first GEMM, so export it into the child env rather than relying on
+        # in-process setup.
+        train_env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     logger.info("Running training: {}", " ".join(train_cmd))
     result = subprocess.run(  # noqa: S603
-        train_cmd, stderr=subprocess.PIPE, text=True, check=False, timeout=timeout
+        train_cmd,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env=train_env,
     )
     assert result.returncode == 0, f"train.py failed:\n{result.stderr}"
 

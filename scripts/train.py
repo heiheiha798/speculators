@@ -1,6 +1,7 @@
 import argparse
 import gc
 import logging
+import os
 import random
 import warnings
 from copy import deepcopy
@@ -63,6 +64,14 @@ def set_seed(seed: int, deterministic: bool = False):
         # For deterministic behavior (may impact performance)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # cuBLAS GEMMs need a fixed workspace to be reproducible. This must be
+        # set before the first CUDA GEMM; the e2e harness also exports it into
+        # the subprocess env so it is honored regardless of import ordering.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        # Force deterministic kernels where available. warn_only=True so ops
+        # without a deterministic implementation (e.g. some attention backends)
+        # degrade gracefully instead of raising mid-training.
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _maybe_apply_mrope_full_head_hack(
