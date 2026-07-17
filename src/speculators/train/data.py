@@ -419,8 +419,11 @@ class ArrowDataset(BaseDataset):
             return loaded_hs
         finally:
             if hs_filepath is not None:
-                Path(hs_filepath).unlink(missing_ok=True)
-                Path(hs_filepath + ".lock").unlink(missing_ok=True)
+                artifact_path = Path(hs_filepath)
+                lock_path = Path(hs_filepath + ".lock")
+                # A remaining service lock may still be owned after a wait timeout.
+                if not lock_path.exists():
+                    artifact_path.unlink(missing_ok=True)
 
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
