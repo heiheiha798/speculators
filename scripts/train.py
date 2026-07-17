@@ -14,6 +14,9 @@ from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from speculators.data_generation.artifact_cache import (
+    canonical_hidden_state_extraction_namespace,
+)
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
@@ -590,6 +593,12 @@ def main(args: argparse.Namespace):  # noqa: C901
 
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)
+    shared_artifacts_namespace = None
+    if args.shared_hidden_states_path is not None:
+        shared_artifacts_namespace = canonical_hidden_state_extraction_namespace(
+            tuple(int(layer_id) for layer_id in draft_model.target_layer_ids),
+            user_namespace=args.shared_hidden_states_namespace,
+        )
 
     if args.speculator_type == "mtp":
         args.num_speculative_steps = draft_model.config.num_speculative_steps
@@ -640,7 +649,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
         shared_artifacts_path=args.shared_hidden_states_path,
-        shared_artifacts_namespace=args.shared_hidden_states_namespace,
+        shared_artifacts_namespace=shared_artifacts_namespace,
         shared_artifacts_ttl_seconds=(
             None
             if args.shared_hidden_states_ttl == 0
@@ -771,6 +780,31 @@ def validate_draft_init_args(
             "--draft-config defines the draft decoder, so these flags conflict with "
             f"it (remove them): {', '.join(shaping)}"
         )
+
+
+def _validate_shared_hidden_state_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.shared_hidden_states_path is not None:
+        if not args.shared_hidden_states_path.strip():
+            parser.error("--shared-hidden-states-path must be non-empty")
+        if args.legacy_data:
+            parser.error(
+                "--shared-hidden-states-path is incompatible with --legacy-data"
+            )
+    elif args.shared_hidden_states_namespace is not None:
+        parser.error(
+            "--shared-hidden-states-namespace requires --shared-hidden-states-path"
+        )
+    if (
+        args.shared_hidden_states_namespace is not None
+        and not args.shared_hidden_states_namespace.strip()
+    ):
+        parser.error("--shared-hidden-states-namespace must be non-empty")
+    if args.shared_hidden_states_ttl < 0:
+        parser.error("--shared-hidden-states-ttl must be non-negative")
+    if args.shared_hidden_states_lock_timeout <= 0:
+        parser.error("--shared-hidden-states-lock-timeout must be positive")
 
 
 def parse_args():
@@ -907,7 +941,8 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "Optional identity namespace for the producer's extraction configuration. "
+            "Optional additional identity namespace for the producer's extraction "
+            "configuration. Target layer IDs are always included automatically. "
             "Trainers sharing artifacts must use the same value."
         ),
     )
@@ -1338,6 +1373,7 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    _validate_shared_hidden_state_args(parser, args)
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:
