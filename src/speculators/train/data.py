@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import uuid
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -13,9 +14,13 @@ import openai
 import torch
 import torch.nn.functional as F  # noqa: N812
 from datasets import load_from_disk
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch.utils.data import Dataset
 
+from speculators.data_generation.artifact_cache import (
+    HiddenStateArtifactCache,
+    canonical_hidden_state_request_id,
+)
 from speculators.data_generation.offline import check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
@@ -226,6 +231,17 @@ def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
     return None
 
 
+def _atomic_save_hs_file(data: dict[str, torch.Tensor], file_path: Path) -> None:
+    temporary = file_path.parent / (
+        f".{file_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        save_file(data, temporary)
+        temporary.replace(file_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class ArrowDataset(BaseDataset):
     def __init__(
         self,
@@ -241,6 +257,10 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        shared_artifacts_path: str | PathLike | None = None,
+        shared_artifacts_namespace: str | None = None,
+        shared_artifacts_ttl_seconds: float | None = 3600.0,
+        shared_artifacts_lock_timeout_seconds: float = 300.0,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -279,6 +299,18 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.shared_artifacts_namespace = shared_artifacts_namespace
+        self.artifact_cache = (
+            HiddenStateArtifactCache(
+                shared_artifacts_path,
+                artifact_ttl_seconds=shared_artifacts_ttl_seconds,
+                lock_timeout_seconds=shared_artifacts_lock_timeout_seconds,
+            )
+            if shared_artifacts_path is not None
+            else None
+        )
+        if self.artifact_cache is not None:
+            self.artifact_cache.cleanup_stale()
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -316,6 +348,26 @@ class ArrowDataset(BaseDataset):
         client_item = build_client_item(dataset_item)
 
         try:
+            if self.artifact_cache is not None:
+                request_id = canonical_hidden_state_request_id(
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    namespace=self.shared_artifacts_namespace,
+                )
+                result = self.artifact_cache.get_or_create(
+                    request_id,
+                    lambda: self._generate_shared_hs(dataset_item, client_item),
+                    lambda data: check_hidden_states(
+                        data, dataset_item["input_ids"].tolist()
+                    ),
+                )
+                loaded_hs = result.data
+                if self.on_generate == "cache":
+                    file_idx = self._map_to_file_idx(index)
+                    target_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+                    _atomic_save_hs_file(loaded_hs, target_path)
+                return loaded_hs
+
             hs_filepath = generate_hidden_states(
                 self.client,  # type:ignore[arg-type]
                 self.model,  # type:ignore[arg-type]
@@ -347,6 +399,28 @@ class ArrowDataset(BaseDataset):
             return None
 
         return loaded_hs
+
+    def _generate_shared_hs(
+        self, dataset_item: dict, client_item: ClientItem
+    ) -> dict[str, torch.Tensor]:
+        hs_filepath: str | None = None
+        try:
+            hs_filepath = generate_hidden_states(
+                self.client,  # type:ignore[arg-type]
+                self.model,  # type:ignore[arg-type]
+                client_item,
+                timeout=self.request_timeout,
+                max_retries=self.max_retries,
+            )
+            loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
+            if loaded_hs is None:
+                raise ValueError(f"Failed to load hidden states from {hs_filepath}")
+            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            return loaded_hs
+        finally:
+            if hs_filepath is not None:
+                Path(hs_filepath).unlink(missing_ok=True)
+                Path(hs_filepath + ".lock").unlink(missing_ok=True)
 
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
